@@ -16,6 +16,7 @@
 //! (every mip and array slice), depth and stencil planes are not.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::*;
@@ -44,16 +45,23 @@ pub(crate) struct Staging {
     /// Mips per array slice.
     mips: u32,
     memory: *const u8,
+    /// Whether the memory is write-watched: unknown, yes, no.
+    watched: AtomicU8,
     last: Mutex<Last>,
 }
 
-/// What a texture's staging buffer holds: the hash of the memory detiled
-/// (memory not watched), or the write-watch asking it was detiled after,
-/// with room to read the memory into.
+const NOT_WATCHED: u8 = 2;
+
+/// What a texture's staging buffer holds: the content hash of the memory
+/// detiled (memory not watched), or the write-watch asking it was detiled
+/// after, with room to read the memory into.
 #[derive(Default)]
 struct Last {
-    hash: Option<blake3::Hash>,
+    hash: Option<[u64; 2]>,
     asked: u64,
+    /// `watch::remap_epoch()` when a `MEM_MAPPED` range was last verified
+    /// committed (0 if not cached).
+    committed_epoch: u64,
     read: Vec<u8>,
 }
 
@@ -187,7 +195,15 @@ impl Staging {
         let start = self.memory as usize;
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
         let last = &mut *last;
-        if let Some((now, written)) = crate::watch::writes(start, start + size, false) {
+        let epoch = crate::watch::remap_epoch();
+        if last.committed_epoch != 0 && last.committed_epoch != epoch {
+            last.committed_epoch = 0;
+            self.watched.store(0, Ordering::Relaxed);
+        }
+        if self.watched.load(Ordering::Relaxed) != NOT_WATCHED
+            && let Some((now, written)) = crate::watch::writes(start, start + size, false)
+        {
+            self.watched.store(1, Ordering::Relaxed);
             if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
                 return 0;
             }
@@ -201,19 +217,33 @@ impl Staging {
             crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
             return size;
         }
-        if !committed(self.memory, size) {
-            #[cfg(feature = "diagnostics")]
-            tracing::debug!(
-                memory = ?self.memory,
-                size,
-                desc = ?self.layout.desc,
-                "a sampled texture's memory is not committed"
-            );
-            return 0;
+        if last.committed_epoch != epoch {
+            match committed_kind(self.memory, size) {
+                Committed::No => {
+                    #[cfg(feature = "diagnostics")]
+                    tracing::debug!(
+                        memory = ?self.memory,
+                        size,
+                        desc = ?self.layout.desc,
+                        "a sampled texture's memory is not committed"
+                    );
+                    return 0;
+                }
+                Committed::Mapped => {
+                    // Only physical-page views (MEM_MAPPED) are guaranteed to
+                    // notify `title_memory_remapped` on unmap, so only cache
+                    // their commit status across submissions.
+                    last.committed_epoch = epoch;
+                    self.watched.store(NOT_WATCHED, Ordering::Relaxed);
+                }
+                Committed::Other => {
+                    self.watched.store(NOT_WATCHED, Ordering::Relaxed);
+                }
+            }
         }
         // SAFETY: committed memory of the texture's layout size.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
-        let hash = blake3::hash(tiled);
+        let hash = content_hash(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
         if last.hash == Some(hash) {
@@ -256,23 +286,44 @@ impl Staging {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Committed {
+    No,
+    Mapped,
+    Other,
+}
+
 /// Whether `[at, at + len)` is committed memory (streamed textures may be
 /// unmapped until their pages arrive).
 pub(crate) fn committed(at: *const u8, len: usize) -> bool {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    committed_kind(at, len) != Committed::No
+}
+
+fn committed_kind(at: *const u8, len: usize) -> Committed {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_MAPPED, MEMORY_BASIC_INFORMATION, VirtualQuery,
+    };
     let mut p = at as usize;
     let end = p + len;
+    let mut all_mapped = true;
     while p < end {
         // SAFETY: plain data filled in by the query.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         // SAFETY: a valid out pointer of the right size.
         let n = unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
         if n == 0 || info.State != MEM_COMMIT {
-            return false;
+            return Committed::No;
+        }
+        if info.Type != MEM_MAPPED {
+            all_mapped = false;
         }
         p = info.BaseAddress as usize + info.RegionSize;
     }
-    true
+    if all_mapped {
+        Committed::Mapped
+    } else {
+        Committed::Other
+    }
 }
 
 /// The staging state of a title texture, made on first use.
@@ -337,8 +388,166 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         layout,
         mips: u32::from(d.MipLevels),
         memory,
+        watched: AtomicU8::new(0),
         last: Mutex::default(),
     });
     map.insert(resource as usize, s.clone());
     Some(s)
+}
+
+/// Fast 128-bit non-cryptographic content digest for detecting changes in
+/// unwatched texture memory. Processes 32 bytes per iteration across four
+/// independent 64-bit accumulators to stay memory-bandwidth-bound.
+fn content_hash(bytes: &[u8]) -> [u64; 2] {
+    const K0: u64 = 0x9E37_79B1_85EB_CA87;
+    const K1: u64 = 0xC2B2_AE3D_27D4_EB4F;
+    const K2: u64 = 0x1656_67B1_9E37_79F9;
+    const K3: u64 = 0x85EB_CA77_C2B2_AE63;
+
+    #[inline(always)]
+    fn mix64(mut x: u64) -> u64 {
+        x ^= x >> 30;
+        x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        x ^= x >> 27;
+        x = x.wrapping_mul(0x94D0_49BB_1331_11EB);
+        x ^ (x >> 31)
+    }
+
+    let mut a0 = K0 ^ (bytes.len() as u64);
+    let mut a1 = K1;
+    let mut a2 = K2;
+    let mut a3 = K3;
+
+    let (chunks, tail32) = bytes.as_chunks::<32>();
+    for chunk in chunks {
+        let w0 = u64::from_le_bytes(chunk[0..8].try_into().unwrap());
+        let w1 = u64::from_le_bytes(chunk[8..16].try_into().unwrap());
+        let w2 = u64::from_le_bytes(chunk[16..24].try_into().unwrap());
+        let w3 = u64::from_le_bytes(chunk[24..32].try_into().unwrap());
+        a0 = a0.wrapping_add(w0).wrapping_mul(K0).rotate_left(31);
+        a1 = a1.wrapping_add(w1).wrapping_mul(K1).rotate_left(29);
+        a2 = a2.wrapping_add(w2).wrapping_mul(K2).rotate_left(33);
+        a3 = a3.wrapping_add(w3).wrapping_mul(K3).rotate_left(27);
+    }
+
+    let (words, tail) = tail32.as_chunks::<8>();
+    for (i, word) in words.iter().enumerate() {
+        let w = u64::from_le_bytes(*word);
+        match i {
+            0 => a0 = a0.wrapping_add(w).wrapping_mul(K0).rotate_left(31),
+            1 => a1 = a1.wrapping_add(w).wrapping_mul(K1).rotate_left(29),
+            _ => a2 = a2.wrapping_add(w).wrapping_mul(K2).rotate_left(33),
+        }
+    }
+
+    if !tail.is_empty() {
+        let mut buf = [0u8; 8];
+        buf[..tail.len()].copy_from_slice(tail);
+        let w = u64::from_le_bytes(buf);
+        a3 = a3.wrapping_add(w).wrapping_mul(K3).rotate_left(27);
+    }
+
+    let lo = mix64(a0 ^ a2.rotate_left(17) ^ (bytes.len() as u64).wrapping_mul(K1));
+    let hi = mix64(a1 ^ a3.rotate_left(23) ^ lo.wrapping_mul(K2));
+    [lo, hi]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn content_hash_detects_single_bit_tail_and_order_changes() {
+        let mut data: Vec<u8> = (0..4099).map(|i| (i * 37 + 13) as u8).collect();
+        let base = content_hash(&data);
+        assert_eq!(base, content_hash(&data));
+
+        // Single-bit flips across main loop, 8-byte remainder, and 1..7-byte tail.
+        for pos in [0, 7, 8, 31, 32, 1024, 4088, 4095, 4096, 4098] {
+            data[pos] ^= 1;
+            assert_ne!(content_hash(&data), base, "missed bit flip at {pos}");
+            data[pos] ^= 1;
+        }
+
+        // Swapping two 8-byte lanes must change the digest.
+        let mut swapped = data.clone();
+        for i in 0..8 {
+            swapped.swap(i, i + 8);
+        }
+        assert_ne!(content_hash(&swapped), base);
+
+        // Appending a zero byte must change the digest.
+        let mut extended = data.clone();
+        extended.push(0);
+        assert_ne!(content_hash(&extended), base);
+
+        // Small sizes (0..=40) are all distinct when filled with zeros.
+        let mut seen = std::collections::HashSet::new();
+        for len in 0..=40 {
+            let h = content_hash(&vec![0u8; len]);
+            assert!(seen.insert(h), "collision on zero buffer of length {len}");
+        }
+    }
+
+    #[test]
+    fn committed_kind_distinguishes_mapped_and_private_and_remap_advances_epoch() {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, PAGE_READWRITE, UnmapViewOfFile,
+        };
+
+        let private = vec![0u8; 4096];
+        assert!(committed_kind(private.as_ptr(), private.len()) == Committed::Other);
+
+        // SAFETY: pagefile-backed section of 1 page, unmapped and closed below.
+        unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                4096,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            let view = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 4096);
+            assert!(!view.Value.is_null());
+            assert!(committed_kind(view.Value.cast(), 4096) == Committed::Mapped);
+
+            let before = crate::watch::remap_epoch();
+            crate::watch::title_memory_remapped(view.Value as usize, 4096);
+            assert!(crate::watch::remap_epoch() > before);
+
+            UnmapViewOfFile(view);
+            CloseHandle(section);
+        }
+    }
+
+    #[test]
+    #[ignore = "benchmark"]
+    fn content_hash_vs_blake3_throughput() {
+        let buf: Vec<u8> = (0..(16 << 20)).map(|i| (i * 131) as u8).collect();
+        let t0 = std::time::Instant::now();
+        let mut b3 = [0u8; 32];
+        for _ in 0..10 {
+            b3 = *std::hint::black_box(blake3::hash(std::hint::black_box(&buf))).as_bytes();
+        }
+        let blake3_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+        let t1 = std::time::Instant::now();
+        let mut fast = [0u64; 2];
+        for _ in 0..10 {
+            fast = std::hint::black_box(content_hash(std::hint::black_box(&buf)));
+        }
+        let fast_ms = t1.elapsed().as_secs_f64() * 1000.0;
+
+        eprintln!(
+            "160 MiB: blake3={blake3_ms:.2} ms ({:.2} GB/s), content_hash={fast_ms:.2} ms ({:.2} GB/s), speedup={:.1}x (b3[0]={}, fast={:?})",
+            0.160 / (blake3_ms / 1000.0),
+            0.160 / (fast_ms / 1000.0),
+            blake3_ms / fast_ms,
+            b3[0],
+            fast,
+        );
+    }
 }

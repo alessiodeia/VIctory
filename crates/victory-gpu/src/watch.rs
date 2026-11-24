@@ -20,6 +20,16 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Incremented whenever the runtime maps or unmaps physical-page views
+/// ([`title_memory_remapped`]). Callers caching view commit/watch state can
+/// compare against this counter and re-verify when it advances.
+static REMAP_EPOCH: AtomicU64 = AtomicU64::new(1);
+
+pub(crate) fn remap_epoch() -> u64 {
+    REMAP_EPOCH.load(Ordering::Acquire)
+}
 
 /// The unit tracked and copied: 64 KiB, the console's page (the kernel's
 /// 4 KiB pages fold into it). Finer units made the checks of the world's
@@ -217,6 +227,7 @@ pub fn writing(at: usize, len: usize) {
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
 /// shows is new and read-write, so it is no longer guarded.
 pub fn title_memory_remapped(at: usize, len: usize) {
+    REMAP_EPOCH.fetch_add(1, Ordering::Release);
     let mut g = guards();
     let blocks: Vec<usize> = g
         .protected
