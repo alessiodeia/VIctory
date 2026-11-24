@@ -971,6 +971,12 @@ fn fits(texture: &ID3D12Resource, castable: &[u32], mut format: Option<&mut DXGI
     }
     let view = format.as_ref().map_or(0, |f| f.0 as u32);
     if view == 0 {
+        // A view without a format takes the texture's: an unordered one is
+        // only made if the host stores to that format.
+        if unordered && !typeless && !typed_store(own) {
+            once!(own, "an unordered view in a format the host cannot store");
+            return false;
+        }
         return !typeless;
     }
     let cast = castable.contains(&view);
@@ -978,7 +984,13 @@ fn fits(texture: &ID3D12Resource, castable: &[u32], mut format: Option<&mut DXGI
         once!(view, own, "view format of another family");
         return false;
     }
-    if cast && family(view) != family(own) && unordered && !typed_store(view) {
+    // The format the view is made in: the texture's own unless the view
+    // casts or the texture is typeless. A texture made with castable formats
+    // may take the unordered flag in a format the host does not store to
+    // (B5G5R5A1 castable to R16_UINT), and a typed unordered view in that
+    // format removes the device.
+    let made = if !typeless && !cast { own } else { view };
+    if unordered && !typed_store(made) {
         once!(view, own, "an unordered view in a format the host cannot store");
         return false;
     }
@@ -1401,6 +1413,78 @@ mod tests {
         };
         let view = View::Unordered(0, 0, Some([28, 8, 0, 0, 0, 0, 0, 0, 0, 0]));
         null_for(&view, heap.cpu(0));
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    /// A texture made with castable formats can take the unordered flag in
+    /// a format the device does not store to (the world's B5G5R5A1 texture,
+    /// castable to R16_UINT, on an RTX 2070 SUPER). An unordered view in the
+    /// texture's own format, or without a format, is only made if the device
+    /// stores to it: otherwise it removes the device
+    /// (`DXGI_ERROR_INVALID_CALL`).
+    #[test]
+    fn unordered_views_need_a_format_the_device_stores_to() {
+        use windows::core::Interface;
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let Ok(device) = host.device.cast::<ID3D12Device10>() else {
+            return; // no castable formats on this host
+        };
+        let mut checked = 0;
+        // B5G6R5, B5G5R5A1, B4G4R4A4, and R8G8B8A8_UNORM (always stored to).
+        for format in [85u32, 86, 115, 28] {
+            let formats: Vec<DXGI_FORMAT> =
+                crate::resource::castable(format).iter().map(|&f| DXGI_FORMAT(f as i32)).collect();
+            let desc = D3D12_RESOURCE_DESC1 {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 4,
+                Height: 4,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: DXGI_FORMAT(format as i32),
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                ..Default::default()
+            };
+            let mut texture: Option<ID3D12Resource> = None;
+            // SAFETY: a plain texture description, the list and our out
+            // pointer live through the call.
+            let made = unsafe {
+                device.CreateCommittedResource3(
+                    &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_BARRIER_LAYOUT_COMMON,
+                    None,
+                    None::<&ID3D12ProtectedResourceSession>,
+                    Some(&formats),
+                    &mut texture,
+                )
+            };
+            let (Ok(()), Some(texture)) = (made, texture) else {
+                continue; // the device does not make such a texture at all
+            };
+            checked += 1;
+            let castable = crate::resource::castable(format);
+            let stores = typed_store(format);
+            let mut view = DXGI_FORMAT(format as i32);
+            assert_eq!(fits(&texture, &castable, Some(&mut view), true), stores, "format {format}, view in its own format");
+            assert_eq!(fits(&texture, &castable, None, true), stores, "format {format}, view without a format");
+            assert!(fits(&texture, &castable, None, false), "format {format}, shader resource view");
+            if stores {
+                let heap = HostHeap::new(false, 4).unwrap();
+                let uav = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                    Format: view,
+                    ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+                    ..Default::default()
+                };
+                // SAFETY: a live texture and a slot of our heap.
+                unsafe { host.device.CreateUnorderedAccessView(&texture, None, Some(&uav), heap.cpu(0)) };
+            }
+        }
+        assert!(checked > 0, "R8G8B8A8_UNORM at least is made");
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
