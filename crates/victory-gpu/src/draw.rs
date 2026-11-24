@@ -671,14 +671,33 @@ impl State {
                 .map(|u| u.table_offset_dwords / 8 + 1)
                 .max()
                 .unwrap_or(1);
+            let host_span = self
+                .heap_of(table)
+                .and_then(|heap| heap.host().map(|host| (heap, host)));
             let needs_fresh = (0..n).any(|k| {
-                matches!(
-                    crate::descriptor::view(table + u64::from(k) * 32),
-                    Some(View::Constant(address, size))
-                        if size == 0
-                            || !crate::shadow::find(address, u64::from(size.next_multiple_of(256)))
-                                .is_some_and(|s| s.gpu(address).is_multiple_of(256))
-                )
+                let handle = table + u64::from(k) * 32;
+                let out_of_host = host_span.is_some_and(|(heap, host)| {
+                    heap.index(handle).is_none_or(|index| index >= host.count())
+                });
+                if out_of_host {
+                    return true;
+                }
+                let named = used
+                    .iter()
+                    .filter(tables)
+                    .any(|u| u.slot == slot && u.table_offset_dwords / 8 == k);
+                match crate::descriptor::view(handle) {
+                    Some(View::Constant(address, size)) => {
+                        !named
+                            || size == 0
+                            || !crate::shadow::find(address, u64::from(size)).is_some_and(|s| {
+                                s.gpu(address).is_multiple_of(256)
+                                    && s.left(address) >= u64::from(size).next_multiple_of(256)
+                            })
+                    }
+                    Some(_) => !named,
+                    None => false,
+                }
             });
             if needs_fresh {
                 fresh.push(slot);
@@ -1280,11 +1299,16 @@ mod tests {
         );
         let heap_start = slot::<extern "system" fn(This) -> u64>(heap_obj, 0x48)(heap_obj);
 
-        // Create a 4096-byte committed buffer so its shadow buffer is 256-byte aligned.
+        // Create a 4224-byte (4096 + 128) committed buffer so offset 4096 is
+        // 256-byte aligned on the host while its 256-byte-padded CBV size runs
+        // past the shadow end.
+        const TAIL_OFFSET: u64 = 4096;
+        const TAIL_SIZE: u32 = 128;
+        const BUF_SIZE: u32 = TAIL_OFFSET as u32 + TAIL_SIZE;
         let props = [2u32, 0, 0, 0, 0]; // UPLOAD heap
         let buf_desc = [
             1u32, // BUFFER
-            0, 0, 0, 4096, 0, // alignment=0, width=4096
+            0, 0, 0, BUF_SIZE, 0, // alignment=0, width=4224
             1, 0x0001_0001, 0, 1, 0, 1, 0, 0,
         ];
         let mut buf: This = null;
@@ -1303,8 +1327,12 @@ mod tests {
             S_OK
         );
         let (data, len) = crate::resource::buffer_bytes(buf).expect("buffer bytes");
-        assert!(len >= 4096);
+        assert!(len >= u64::from(BUF_SIZE));
         let base = data as u64;
+        let tail = base + TAIL_OFFSET;
+        let tail_shadow = crate::shadow::find(tail, u64::from(TAIL_SIZE)).expect("tail shadow");
+        assert!(tail_shadow.gpu(tail).is_multiple_of(256));
+        assert_eq!(tail_shadow.left(tail), u64::from(TAIL_SIZE));
 
         let write_cbv = |slot_idx: u64, addr: u64, size: u32| {
             let cbv = [addr as u32, (addr >> 32) as u32, size, 0];
@@ -1315,7 +1343,11 @@ mod tests {
         // Slot 1: 16-byte aligned (misaligned for PC) CBV -> needs dynamic slots.
         write_cbv(1, base + 16, 256);
         // Slot 2: 256-byte aligned start, but padded 256-byte size runs past shadow end -> needs dynamic slots.
-        write_cbv(2, base + 4096 - 128, 128);
+        write_cbv(2, tail, TAIL_SIZE);
+        // Slots 3..=5: all aligned CBVs, with slot 4 unnamed in `used_sparse` -> needs dynamic slots.
+        write_cbv(3, base, 256);
+        write_cbv(4, base + 256, 256);
+        write_cbv(5, base + 512, 256);
 
         let used = [UsedResource {
             kind: ResourceType::Cbv,
@@ -1327,6 +1359,28 @@ mod tests {
             user_data: 0,
             slot: 0,
         }];
+        let used_sparse = [
+            UsedResource {
+                kind: ResourceType::Cbv,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            },
+            UsedResource {
+                kind: ResourceType::Cbv,
+                root: RootType::Table,
+                table_offset_dwords: 16,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            },
+        ];
 
         let mut state = State::default();
         state.set_heaps(&[heap_obj]);
@@ -1351,6 +1405,13 @@ mod tests {
         assert!(!state.table_failed);
         assert_eq!(made.len(), 1, "CBV padded past shadow end must use dynamic slots");
         assert_eq!(state.dynamic.len(), 2);
+
+        // 4) Table spanning an unnamed populated slot (dynamic indexing): allocates dynamic slots.
+        state.set_table(false, 0, heap_start + 96);
+        let made = state.tables(&list, &used_sparse, false);
+        assert!(!state.table_failed);
+        assert_eq!(made.len(), 1, "table with unnamed populated slot must use dynamic slots");
+        assert_eq!(state.dynamic.len(), 3);
 
         list.close();
     }
