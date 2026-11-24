@@ -518,7 +518,19 @@ mod tests {
             crate::watch::title_memory_remapped(view.Value as usize, 4096);
             assert!(crate::watch::remap_epoch() > before);
 
+            // `xmem::unmap` order: the epoch advances, a refresh between that
+            // and the unmap still sees the view mapped and caches it under
+            // the new epoch, then the view goes away.
+            let cached = crate::watch::remap_epoch();
+            assert!(committed_kind(view.Value.cast(), 4096) == Committed::Mapped);
             UnmapViewOfFile(view);
+            assert!(committed_kind(view.Value.cast(), 4096) == Committed::No);
+            crate::watch::title_memory_unmapped(view.Value as usize, 4096);
+            assert_ne!(
+                crate::watch::remap_epoch(),
+                cached,
+                "a mapping cached between the notification and the unmap must not stay current"
+            );
             CloseHandle(section);
         }
     }
